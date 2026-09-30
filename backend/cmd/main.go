@@ -8,19 +8,21 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/gin-gonic/gin"
 	_ "github.com/glebarez/go-sqlite"
+
+	models "eloquentia/backend/internal"
 )
 
 type App struct {
 	db *sql.DB
 }
 
-type ProfileParams struct {
-	Name           string `json:"name" binding:"required"`
-	NativeLanguage string `json:"native_language" binding:"required"`
-	TargetLanguage string `json:"target_language" binding:"required"`
+type Profile struct {
+	ID int64 `json:"id"`
+	models.ProfileParams
 }
 
 func main() {
@@ -41,6 +43,7 @@ func NewRouter(app *App) *gin.Engine {
 	r := gin.Default()
 	r.GET("/health", Health)
 	r.POST("/profile/create", app.CreateProfile)
+	r.GET("/profile/fetch", app.GetProfile)
 	return r
 }
 
@@ -54,16 +57,7 @@ func NewApp() (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	dbPath := filepath.Join(userConfigDir, "eloquentia/eloquentia.db")
-	_, err = os.Stat(dbPath)
-	if errors.Is(err, os.ErrNotExist) {
-		err = os.WriteFile(dbPath, nil, 0644)
-		if err != nil {
-			return nil, err
-		}
-	} else if err != nil {
-		return nil, err
-	}
+	dbPath := filepath.Join(userConfigDir, "eloquentia", "eloquentia.db")
 
 	db, err := sql.Open("sqlite", dbPath)
 	if err != nil {
@@ -97,7 +91,7 @@ func Run(r *gin.Engine) error {
 }
 
 func (a *App) CreateProfile(c *gin.Context) {
-	var profileParams ProfileParams
+	var profileParams models.ProfileParams
 	err := c.ShouldBindJSON(&profileParams)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Missing request parameters"})
@@ -118,11 +112,33 @@ func (a *App) CreateProfile(c *gin.Context) {
 
 	id, err := profile.LastInsertId()
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal struct to JSON"})
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed to get inserted id"})
 		return
 	}
 
 	c.JSON(http.StatusCreated, gin.H{"message": "Success!", "id": id})
+}
+
+func (a *App) GetProfile(c *gin.Context) {
+	id, err := strconv.ParseInt(c.Query("id"), 10, 64)
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Invalid or missing id"})
+		return
+	}
+
+	var profile Profile
+	err = a.db.QueryRow(`select id, name, native_language, target_language from Users where id = ?`, id).
+		Scan(&profile.ID, &profile.Name, &profile.NativeLanguage, &profile.TargetLanguage)
+	if errors.Is(err, sql.ErrNoRows) {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": "Profile not found"})
+		return
+	}
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed querying database"})
+		return
+	}
+
+	c.JSON(http.StatusOK, profile)
 }
 
 func Health(c *gin.Context) {
