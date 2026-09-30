@@ -13,24 +13,73 @@ import (
 	_ "github.com/glebarez/go-sqlite"
 )
 
+type App struct {
+	db *sql.DB
+}
+
 type ProfileParams struct {
-	Name           string `json:"name"`
-	NativeLanguage string `json:"native_language"`
-	TargetLanguage string `json:"target_language"`
+	Name           string `json:"name" binding:"required"`
+	NativeLanguage string `json:"native_language" binding:"required"`
+	TargetLanguage string `json:"target_language" binding:"required"`
 }
 
 func main() {
-	err := Run(NewRouter())
+	app, err := NewApp()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	defer app.db.Close()
+
+	err = Run(NewRouter(app))
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func NewRouter() *gin.Engine {
+func NewRouter(app *App) *gin.Engine {
 	r := gin.Default()
 	r.GET("/health", Health)
-	r.POST("/profile/create", CreateProfile)
+	r.POST("/profile/create", app.CreateProfile)
 	return r
+}
+
+func NewApp() (*App, error) {
+	userConfigDir, err := os.UserConfigDir()
+	if err != nil {
+		return nil, err
+	}
+
+	err = os.MkdirAll(filepath.Join(userConfigDir, "eloquentia"), 0755)
+	if err != nil {
+		return nil, err
+	}
+	dbPath := filepath.Join(userConfigDir, "eloquentia/eloquentia.db")
+	_, err = os.Stat(dbPath)
+	if errors.Is(err, os.ErrNotExist) {
+		err = os.WriteFile(dbPath, nil, 0644)
+		if err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
+	}
+
+	db, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		return nil, err
+	}
+
+	_, err = db.Exec(`create table if not exists Users (id integer primary key autoincrement,
+		name varchar(255),
+		native_language varchar(255),
+		target_language varchar(255))`)
+	if err != nil {
+		db.Close()
+		return nil, err
+	}
+
+	return &App{db: db}, nil
 }
 
 func Run(r *gin.Engine) error {
@@ -43,69 +92,37 @@ func Run(r *gin.Engine) error {
 	port := flag.String("port", portEnv, "Port for the API")
 
 	flag.Parse()
+
 	return r.Run("127.0.0.1:" + *port)
 }
 
-func CreateProfile(c *gin.Context) {
+func (a *App) CreateProfile(c *gin.Context) {
 	var profileParams ProfileParams
-	err := c.BindJSON(&profileParams)
+	err := c.ShouldBindJSON(&profileParams)
 	if err != nil {
-		c.AbortWithStatusJSON(400, gin.H{"error": "Unable to bind request JSON"})
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "Missing request parameters"})
 		return
 	}
 
-	userConfigDir, err := os.UserConfigDir()
-	if err != nil {
-		c.AbortWithStatusJSON(500, gin.H{"error": "Unable to find user config dir"})
-		return
-	}
-
-	err = os.MkdirAll(filepath.Join(userConfigDir, "eloquentia"), 0755)
-	if err != nil {
-		c.AbortWithStatusJSON(500, gin.H{"error": "Unable to create database file. Check permissions."})
-		return
-	}
-	dbPath := filepath.Join(userConfigDir, "eloquentia/eloquentia.db")
-	_, err = os.Stat(dbPath)
-	if errors.Is(err, os.ErrNotExist) {
-		err = os.WriteFile(dbPath, nil, 0644)
-		if err != nil {
-			c.AbortWithStatusJSON(500, gin.H{"error": "Unable to create database file. Check permissions."})
-			return
-		}
-	} else if err != nil {
-		c.AbortWithStatusJSON(500, gin.H{"error": "Unable to open database file. Check permissions."})
-		return
-	}
-
-	db, err := sql.Open("sqlite", dbPath)
-	if err != nil {
-		c.AbortWithStatusJSON(500, gin.H{"error": "Unable to open database"})
-		return
-	}
-	defer db.Close()
-
-	_, err = db.Exec(`create table if not exists Users (id integer primary key autoincrement,
-		name varchar(255),
-		native_language varchar(255),
-		target_language varchar(255))`)
-	if err != nil {
-		c.AbortWithStatusJSON(500, gin.H{"error": "Failed querying database"})
-		return
-	}
-
-	_, err = db.Exec(`
-		insert into users (name, native_language, target_language) values (?, ?, ?)`,
+	profile, err := a.db.Exec(`
+		insert into Users (name, native_language, target_language) values (?, ?, ?)`,
 		profileParams.Name,
 		profileParams.NativeLanguage,
 		profileParams.TargetLanguage,
 	)
+
 	if err != nil {
-		c.AbortWithStatusJSON(500, gin.H{"error": "Failed querying database"})
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed querying database"})
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"message": "Success!"})
+	id, err := profile.LastInsertId()
+	if err != nil {
+		c.AbortWithStatusJSON(http.StatusInternalServerError, gin.H{"error": "Failed to marshal struct to JSON"})
+		return
+	}
+
+	c.JSON(http.StatusCreated, gin.H{"message": "Success!", "id": id})
 }
 
 func Health(c *gin.Context) {
